@@ -221,12 +221,15 @@ async def main() -> None:
         me = await app.get_me()
         logger.info(f"Logged in as: {me.first_name} (@{me.username or 'N/A'})")
         
-        # Keep the client running
-        await app.idle()
+        # Keep the client running using asyncio.Event
+        # This will wait indefinitely until interrupted
+        stop_event = asyncio.Event()
+        await stop_event.wait()
     except KeyboardInterrupt:
         logger.info("Stopping client...")
     finally:
-        await app.stop()
+        if app.is_connected:
+            await app.stop()
         logger.info("Client stopped")
 
 
