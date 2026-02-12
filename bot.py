@@ -242,7 +242,7 @@ def force_unlock_session(session_name: str) -> bool:
         session_name: Name of the session file (without .session extension)
         
     Returns:
-        bool: True if unlock was attempted, False otherwise
+        bool: True if unlock was successful, False otherwise
     """
     session_file = Path(f"{session_name}.session")
     session_journal = Path(f"{session_name}.session-journal")
@@ -254,23 +254,46 @@ def force_unlock_session(session_name: str) -> bool:
         # Remove journal file if it exists (this often resolves stale locks)
         if session_journal.exists():
             logger.warning(f"Removing stale journal file: {session_journal}")
-            session_journal.unlink()
+            try:
+                session_journal.unlink()
+            except Exception as e:
+                logger.warning(f"Could not remove journal file: {e}")
         
-        # Try to recover the database by opening and closing it
-        try:
-            conn = sqlite3.connect(str(session_file), timeout=5.0)
-            # Try to execute a simple query to ensure the database is accessible
-            conn.execute("SELECT 1")
-            conn.close()
-            logger.info("Session file unlocked successfully")
-            return True
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e).lower():
-                logger.warning("Session file is still locked after removing journal. Another process may be using it.")
-                return False
-            else:
-                logger.warning(f"Database error during unlock attempt: {e}")
-                return False
+        # Try multiple times to ensure the database is accessible
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                conn = sqlite3.connect(str(session_file), timeout=2.0)
+                # Try to execute a simple query to ensure the database is accessible
+                conn.execute("SELECT 1")
+                # Try to get an exclusive lock to ensure no other process is using it
+                conn.execute("BEGIN EXCLUSIVE")
+                conn.rollback()
+                conn.close()
+                if attempt > 0:
+                    logger.info(f"Session file unlocked successfully after {attempt + 1} attempts")
+                else:
+                    logger.info("Session file unlocked successfully")
+                return True
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower():
+                    if attempt < max_attempts - 1:
+                        time.sleep(1)  # Wait a bit before retrying
+                        continue
+                    else:
+                        logger.warning("Session file is still locked after multiple attempts. Another process may be using it.")
+                        return False
+                else:
+                    logger.warning(f"Database error during unlock attempt: {e}")
+                    return False
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    logger.warning(f"Error during unlock attempt: {e}")
+                    return False
+        return False
     except Exception as e:
         logger.error(f"Error attempting to force unlock session: {e}")
         return False
@@ -538,11 +561,23 @@ async def main() -> None:
     logger.info("  - Telegram API availability in your region")
     logger.info("Press Ctrl+C to stop")
     
+    lock_retry_count = 0
+    max_lock_retries = 3  # Prevent infinite lock retry loops
+    
     while connection_retries < max_connection_retries:
         try:
+            # Ensure client is stopped before starting (in case of retry)
+            if app.is_connected:
+                try:
+                    await app.stop()
+                    await asyncio.sleep(1)  # Give time for cleanup
+                except Exception:
+                    pass
+            
             await app.start()
             logger.info("Client started successfully")
             connection_retries = 0  # Reset on successful connection
+            lock_retry_count = 0  # Reset lock retry count on successful connection
             
             # Get info about the logged-in user
             me = await app.get_me()
@@ -607,7 +642,26 @@ async def main() -> None:
                     is_db_lock = True
             
             if is_db_lock:
+                lock_retry_count += 1
                 logger.error("Database lock error detected!")
+                
+                # Prevent infinite lock retry loops
+                if lock_retry_count > max_lock_retries:
+                    logger.error(f"Max lock retry attempts ({max_lock_retries}) reached. Exiting to prevent infinite loop.")
+                    logger.error("Please manually resolve the session lock issue:")
+                    logger.error(f"  1. Stop any other running instances of the bot")
+                    logger.error(f"  2. Delete '{SESSION_NAME}.session' and '{SESSION_NAME}.session-journal' if corrupted")
+                    logger.error(f"  3. Restart the bot (you'll need to re-authenticate)")
+                    break
+                
+                # Ensure client is stopped before attempting unlock
+                try:
+                    if app.is_connected:
+                        await app.stop()
+                    await asyncio.sleep(2)  # Give time for cleanup and lock release
+                except Exception as stop_error:
+                    logger.debug(f"Error stopping client during lock handling: {stop_error}")
+                
                 is_locked, lock_message = check_session_lock(SESSION_NAME)
                 if is_locked:
                     logger.error(lock_message)
@@ -615,26 +669,24 @@ async def main() -> None:
                     unlocked = await wait_for_session_unlock(SESSION_NAME, max_wait=10)
                     if unlocked:
                         logger.info("Session unlocked! Retrying connection...")
-                        connection_retries = 0  # Reset retries since we resolved the lock
-                        await asyncio.sleep(2)  # Brief pause before retry
+                        await asyncio.sleep(3)  # Longer pause to ensure lock is fully released
                         continue
                     else:
                         logger.warning("Session is still locked. Attempting to force unlock stale lock...")
                         force_unlocked = force_unlock_session(SESSION_NAME)
                         if force_unlocked:
                             logger.info("Stale lock removed! Retrying connection...")
-                            connection_retries = 0  # Reset retries since we resolved the lock
-                            await asyncio.sleep(2)  # Brief pause before retry
+                            await asyncio.sleep(3)  # Longer pause to ensure lock is fully released
                             continue
                         else:
-                            logger.error("Session is still locked. Please resolve the issue manually.")
-                            logger.error("You may need to:")
-                            logger.error(f"  1. Stop any other running instances of the bot")
-                            logger.error(f"  2. Delete '{SESSION_NAME}.session' and '{SESSION_NAME}.session-journal' if corrupted")
-                            break
+                            logger.error("Session is still locked after force unlock attempt.")
+                            logger.error(f"Lock retry count: {lock_retry_count}/{max_lock_retries}")
+                            # Continue to retry loop instead of breaking immediately
+                            connection_retries += 1
                 else:
-                    logger.error(f"Database lock error: {e}")
-                    connection_retries += 1
+                    logger.warning(f"Database lock error detected but session check shows unlocked. Retrying...")
+                    await asyncio.sleep(3)  # Brief pause before retry
+                    continue
             else:
                 logger.error(f"Unexpected error: {e}", exc_info=True)
                 connection_retries += 1
