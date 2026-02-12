@@ -3,15 +3,19 @@ Async Telegram Client - Channel Post Processor
 
 Listens to posts from SOURCE_CHANNEL_ID, extracts the first number,
 divides it by 3.63, and forwards the modified message to TARGET_CHANNEL_ID.
+Also saves posts to a file for backup.
 
 Uses Pyrogram (MTProto API) with API ID and API Hash.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sys
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -28,6 +32,10 @@ API_HASH = os.getenv("API_HASH")
 SESSION_NAME = os.getenv("SESSION_NAME", "bot_session")
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL")
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL")
+SAVE_POSTS = os.getenv("SAVE_POSTS", "true").lower() == "true"
+POSTS_FILE = os.getenv("POSTS_FILE", "saved_posts.json")
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY = int(os.getenv("RETRY_DELAY", "5"))
 
 # Validate configuration
 if not API_ID:
@@ -73,6 +81,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Reduce Pyrogram connection logging noise
+logging.getLogger("pyrogram.connection.connection").setLevel(logging.WARNING)
+logging.getLogger("pyrogram.connection.transport").setLevel(logging.WARNING)
+logging.getLogger("pyrogram.session.session").setLevel(logging.WARNING)
 
 
 def extract_and_process_number(text: str) -> Optional[tuple[str, str]]:
@@ -130,6 +143,41 @@ def replace_first_number(text: str, original: str, replacement: str) -> str:
     return modified_text
 
 
+def save_post_to_file(message_data: dict) -> None:
+    """
+    Save post data to a JSON file for backup.
+    
+    Args:
+        message_data: Dictionary containing message information
+    """
+    if not SAVE_POSTS:
+        return
+    
+    try:
+        posts_file = Path(POSTS_FILE)
+        
+        # Load existing posts if file exists
+        if posts_file.exists():
+            try:
+                with open(posts_file, 'r', encoding='utf-8') as f:
+                    posts = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                posts = []
+        else:
+            posts = []
+        
+        # Add new post
+        posts.append(message_data)
+        
+        # Save back to file
+        with open(posts_file, 'w', encoding='utf-8') as f:
+            json.dump(posts, f, ensure_ascii=False, indent=2)
+        
+        logger.debug(f"Post saved to {POSTS_FILE}")
+    except Exception as e:
+        logger.error(f"Error saving post to file: {e}", exc_info=True)
+
+
 async def handle_channel_post(client: Client, message: Message) -> None:
     """
     Handle incoming channel posts from SOURCE_CHANNEL_ID.
@@ -138,6 +186,7 @@ async def handle_channel_post(client: Client, message: Message) -> None:
         client: The Pyrogram client instance
         message: The message object from the channel
     """
+    message_data = None
     try:
         # Only process text messages
         if not message.text:
@@ -147,11 +196,22 @@ async def handle_channel_post(client: Client, message: Message) -> None:
         logger.info(f"New post received from channel {message.chat.id}")
         logger.debug(f"Original text: {message.text}")
         
+        # Save original post to file
+        message_data = {
+            "timestamp": datetime.now().isoformat(),
+            "message_id": message.id,
+            "chat_id": message.chat.id,
+            "original_text": message.text,
+            "processed": False
+        }
+        
         # Extract and process the first number
         result = extract_and_process_number(message.text)
         
         if result is None:
             logger.info("No number found in post, ignoring")
+            message_data["reason"] = "No number found"
+            save_post_to_file(message_data)
             return
         
         original_number, processed_number = result
@@ -165,21 +225,64 @@ async def handle_channel_post(client: Client, message: Message) -> None:
         
         logger.info(f"Modified text: {modified_text}")
         
-        # Send modified message to target channel
-        await client.send_message(
-            chat_id=TARGET_CHANNEL,
-            text=modified_text
-        )
-        
-        logger.info(f"Message sent successfully to channel {TARGET_CHANNEL}")
+        # Try to send with retry logic
+        retries = 0
+        while retries < MAX_RETRIES:
+            try:
+                # Check if client is connected
+                if not client.is_connected:
+                    logger.warning("Client not connected, waiting for reconnection...")
+                    await asyncio.sleep(RETRY_DELAY)
+                    retries += 1
+                    continue
+                
+                # Send modified message to target channel
+                await client.send_message(
+                    chat_id=TARGET_CHANNEL,
+                    text=modified_text
+                )
+                
+                logger.info(f"Message sent successfully to channel {TARGET_CHANNEL}")
+                
+                # Update message data
+                message_data["processed"] = True
+                message_data["modified_text"] = modified_text
+                message_data["original_number"] = original_number
+                message_data["processed_number"] = processed_number
+                save_post_to_file(message_data)
+                return
+                
+            except (ConnectionError, asyncio.TimeoutError, OSError) as e:
+                retries += 1
+                if retries < MAX_RETRIES:
+                    logger.warning(f"Connection error (attempt {retries}/{MAX_RETRIES}): {e}. Retrying in {RETRY_DELAY}s...")
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    logger.error(f"Failed to send message after {MAX_RETRIES} attempts: {e}")
+                    message_data["error"] = str(e)
+                    save_post_to_file(message_data)
+                    raise
     
     except FloodWait as e:
         logger.warning(f"Flood wait: {e.value} seconds. Waiting...")
         await asyncio.sleep(e.value)
+        # Retry after flood wait
+        await handle_channel_post(client, message)
+    except (ConnectionError, asyncio.TimeoutError, OSError) as e:
+        logger.error(f"Connection error in handle_channel_post: {e}")
+        if message_data:
+            message_data["error"] = str(e)
+            save_post_to_file(message_data)
     except RPCError as e:
         logger.error(f"Telegram RPC error: {e}", exc_info=True)
+        if message_data:
+            message_data["error"] = str(e)
+            save_post_to_file(message_data)
     except Exception as e:
         logger.error(f"Unexpected error in handle_channel_post: {e}", exc_info=True)
+        if message_data:
+            message_data["error"] = str(e)
+            save_post_to_file(message_data)
 
 
 async def main() -> None:
@@ -189,13 +292,25 @@ async def main() -> None:
     logger.info("Starting Telegram client...")
     logger.info(f"Source Channel: {SOURCE_CHANNEL}")
     logger.info(f"Target Channel: {TARGET_CHANNEL}")
+    logger.info(f"Save posts to file: {SAVE_POSTS}")
+    if SAVE_POSTS:
+        logger.info(f"Posts file: {POSTS_FILE}")
     
-    # Create Pyrogram client
+    # Create Pyrogram client with improved configuration
     app = Client(
         name=SESSION_NAME,
         api_id=API_ID,
-        api_hash=API_HASH
+        api_hash=API_HASH,
+        # Connection settings for better stability
+        workdir=".",
+        # Reduce timeout issues
+        no_updates=False,
+        takeout=False,
     )
+    
+    # Track connection state
+    connection_retries = 0
+    max_connection_retries = 5
     
     # Register handler for channel posts
     @app.on_message(filters.chat(SOURCE_CHANNEL) & filters.channel)
@@ -209,28 +324,52 @@ async def main() -> None:
         """Handle edited channel posts."""
         await handle_channel_post(client, message)
     
-    # Start the client
+    # Start the client with retry logic
     logger.info("Client is running and listening for channel posts...")
     logger.info("Press Ctrl+C to stop")
     
-    try:
-        await app.start()
-        logger.info("Client started successfully")
-        
-        # Get info about the logged-in user
-        me = await app.get_me()
-        logger.info(f"Logged in as: {me.first_name} (@{me.username or 'N/A'})")
-        
-        # Keep the client running using asyncio.Event
-        # This will wait indefinitely until interrupted
-        stop_event = asyncio.Event()
-        await stop_event.wait()
-    except KeyboardInterrupt:
-        logger.info("Stopping client...")
-    finally:
-        if app.is_connected:
-            await app.stop()
-        logger.info("Client stopped")
+    while connection_retries < max_connection_retries:
+        try:
+            await app.start()
+            logger.info("Client started successfully")
+            connection_retries = 0  # Reset on successful connection
+            
+            # Get info about the logged-in user
+            me = await app.get_me()
+            logger.info(f"Logged in as: {me.first_name} (@{me.username or 'N/A'})")
+            
+            # Keep the client running using asyncio.Event
+            # This will wait indefinitely until interrupted
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+            
+        except (ConnectionError, asyncio.TimeoutError, OSError) as e:
+            connection_retries += 1
+            logger.error(f"Connection error (attempt {connection_retries}/{max_connection_retries}): {e}")
+            if connection_retries < max_connection_retries:
+                logger.info(f"Retrying connection in {RETRY_DELAY * 2} seconds...")
+                await asyncio.sleep(RETRY_DELAY * 2)
+            else:
+                logger.error("Max connection retries reached. Exiting...")
+                break
+        except KeyboardInterrupt:
+            logger.info("Stopping client...")
+            break
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            connection_retries += 1
+            if connection_retries < max_connection_retries:
+                logger.info(f"Retrying in {RETRY_DELAY * 2} seconds...")
+                await asyncio.sleep(RETRY_DELAY * 2)
+            else:
+                break
+        finally:
+            try:
+                if app.is_connected:
+                    await app.stop()
+                logger.info("Client stopped")
+            except Exception as e:
+                logger.error(f"Error stopping client: {e}")
 
 
 if __name__ == "__main__":
