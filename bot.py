@@ -33,6 +33,14 @@ if sys.platform == 'win32':
         # If codecs not available or already UTF-8, continue
         pass
 
+# Fix for Python 3.14+ event loop issue
+# Create event loop before importing pyrogram to avoid RuntimeError
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.errors import (
@@ -344,6 +352,7 @@ async def main() -> None:
         logger.info(f"Posts file: {POSTS_FILE}")
     
     # Create Pyrogram client with improved configuration
+    # Note: Connection retries are handled at the application level in the retry loop below
     app = Client(
         name=SESSION_NAME,
         api_id=API_ID,
@@ -357,7 +366,8 @@ async def main() -> None:
     
     # Track connection state
     connection_retries = 0
-    max_connection_retries = 5
+    max_connection_retries = 10  # Increased retries for network issues
+    base_retry_delay = 15  # Start with 15 seconds delay
     
     # Register handler for channel posts
     # Remove filters.channel to catch all messages from the channel
@@ -377,7 +387,11 @@ async def main() -> None:
         await handle_channel_post(client, message)
     
     # Start the client with retry logic
-    logger.info("Client is running and listening for channel posts...")
+    logger.info("Attempting to connect to Telegram...")
+    logger.info("If you experience connection timeouts, check:")
+    logger.info("  - Your internet connection")
+    logger.info("  - Firewall/proxy settings")
+    logger.info("  - Telegram API availability in your region")
     logger.info("Press Ctrl+C to stop")
     
     while connection_retries < max_connection_retries:
@@ -423,10 +437,13 @@ async def main() -> None:
             connection_retries += 1
             logger.error(f"Connection error (attempt {connection_retries}/{max_connection_retries}): {e}")
             if connection_retries < max_connection_retries:
-                logger.info(f"Retrying connection in {RETRY_DELAY * 2} seconds...")
-                await asyncio.sleep(RETRY_DELAY * 2)
+                # Exponential backoff: increase delay with each retry
+                retry_delay = base_retry_delay * (1.5 ** (connection_retries - 1))
+                logger.info(f"Retrying connection in {retry_delay:.1f} seconds...")
+                await asyncio.sleep(retry_delay)
             else:
                 logger.error("Max connection retries reached. Exiting...")
+                logger.error("Please check your internet connection and firewall settings.")
                 break
         except KeyboardInterrupt:
             logger.info("Stopping client...")
@@ -435,9 +452,12 @@ async def main() -> None:
             logger.error(f"Unexpected error: {e}", exc_info=True)
             connection_retries += 1
             if connection_retries < max_connection_retries:
-                logger.info(f"Retrying in {RETRY_DELAY * 2} seconds...")
-                await asyncio.sleep(RETRY_DELAY * 2)
+                # Exponential backoff: increase delay with each retry
+                retry_delay = base_retry_delay * (1.5 ** (connection_retries - 1))
+                logger.info(f"Retrying in {retry_delay:.1f} seconds...")
+                await asyncio.sleep(retry_delay)
             else:
+                logger.error("Max connection retries reached. Exiting...")
                 break
         finally:
             try:
