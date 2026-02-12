@@ -1,5 +1,3 @@
 pyrogram>=2.0.0
 python-dotenv>=1.0.0
-
-# Optional: tgcrypto for faster encryption (install separately if needed)
-# tgcrypto>=1.2.5
+tgcrypto>=1.2.5

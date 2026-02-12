@@ -20,6 +20,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Fix asyncio event loop for Python 3.14+ compatibility with Pyrogram
+# Python 3.14+ requires explicit event loop policy setup
+# Pyrogram tries to get an event loop during import, so we need to ensure one exists
+if sys.platform == 'win32':
+    # Set Windows event loop policy (suppress deprecation warnings for Python 3.16+)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning, module="asyncio")
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except AttributeError:
+            # Fallback for older Python versions that don't have this
+            pass
+
+# Create or get event loop for Pyrogram's sync wrapper (required for Python 3.14+)
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    # No event loop exists, create one
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 # Fix encoding for Windows console
 if sys.platform == 'win32':
     try:
@@ -209,6 +231,49 @@ def check_session_lock(session_name: str) -> tuple[bool, str]:
             return False, str(e)
     except Exception as e:
         return False, str(e)
+
+
+def force_unlock_session(session_name: str) -> bool:
+    """
+    Attempt to force unlock a stale session file by removing the journal file.
+    This should only be used when you're certain no other instance is running.
+    
+    Args:
+        session_name: Name of the session file (without .session extension)
+        
+    Returns:
+        bool: True if unlock was attempted, False otherwise
+    """
+    session_file = Path(f"{session_name}.session")
+    session_journal = Path(f"{session_name}.session-journal")
+    
+    if not session_file.exists():
+        return False
+    
+    try:
+        # Remove journal file if it exists (this often resolves stale locks)
+        if session_journal.exists():
+            logger.warning(f"Removing stale journal file: {session_journal}")
+            session_journal.unlink()
+        
+        # Try to recover the database by opening and closing it
+        try:
+            conn = sqlite3.connect(str(session_file), timeout=5.0)
+            # Try to execute a simple query to ensure the database is accessible
+            conn.execute("SELECT 1")
+            conn.close()
+            logger.info("Session file unlocked successfully")
+            return True
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower():
+                logger.warning("Session file is still locked after removing journal. Another process may be using it.")
+                return False
+            else:
+                logger.warning(f"Database error during unlock attempt: {e}")
+                return False
+    except Exception as e:
+        logger.error(f"Error attempting to force unlock session: {e}")
+        return False
 
 
 async def wait_for_session_unlock(session_name: str, max_wait: int = 30, check_interval: float = 2.0) -> bool:
@@ -449,11 +514,21 @@ async def main() -> None:
     if is_locked:
         logger.warning("Session file is locked. Attempting to wait for unlock...")
         logger.warning(lock_message)
-        unlocked = await wait_for_session_unlock(SESSION_NAME, max_wait=30)
+        unlocked = await wait_for_session_unlock(SESSION_NAME, max_wait=10)
         if not unlocked:
-            logger.error("Session file is still locked after waiting. Please resolve the issue and try again.")
-            logger.error(lock_message)
-            return
+            logger.warning("Session file is still locked after waiting. Attempting to force unlock stale lock...")
+            logger.warning("Note: This is safe if no other bot instance is running.")
+            force_unlocked = force_unlock_session(SESSION_NAME)
+            if not force_unlocked:
+                logger.error("Session file is still locked. Please resolve the issue manually:")
+                logger.error(lock_message)
+                logger.error("\nTo manually fix:")
+                logger.error(f"  1. Make sure no other bot instance is running")
+                logger.error(f"  2. Delete '{SESSION_NAME}.session' and '{SESSION_NAME}.session-journal'")
+                logger.error(f"  3. Restart the bot (you'll need to re-authenticate)")
+                return
+            else:
+                logger.info("Stale lock removed successfully. Proceeding with connection...")
     
     # Start the client with retry logic
     logger.info("Attempting to connect to Telegram...")
@@ -537,18 +612,26 @@ async def main() -> None:
                 if is_locked:
                     logger.error(lock_message)
                     logger.info("Waiting for session to unlock...")
-                    unlocked = await wait_for_session_unlock(SESSION_NAME, max_wait=30)
+                    unlocked = await wait_for_session_unlock(SESSION_NAME, max_wait=10)
                     if unlocked:
                         logger.info("Session unlocked! Retrying connection...")
                         connection_retries = 0  # Reset retries since we resolved the lock
                         await asyncio.sleep(2)  # Brief pause before retry
                         continue
                     else:
-                        logger.error("Session is still locked. Please resolve the issue manually.")
-                        logger.error("You may need to:")
-                        logger.error(f"  1. Stop any other running instances of the bot")
-                        logger.error(f"  2. Delete '{SESSION_NAME}.session' and '{SESSION_NAME}.session-journal' if corrupted")
-                        break
+                        logger.warning("Session is still locked. Attempting to force unlock stale lock...")
+                        force_unlocked = force_unlock_session(SESSION_NAME)
+                        if force_unlocked:
+                            logger.info("Stale lock removed! Retrying connection...")
+                            connection_retries = 0  # Reset retries since we resolved the lock
+                            await asyncio.sleep(2)  # Brief pause before retry
+                            continue
+                        else:
+                            logger.error("Session is still locked. Please resolve the issue manually.")
+                            logger.error("You may need to:")
+                            logger.error(f"  1. Stop any other running instances of the bot")
+                            logger.error(f"  2. Delete '{SESSION_NAME}.session' and '{SESSION_NAME}.session-journal' if corrupted")
+                            break
                 else:
                     logger.error(f"Database lock error: {e}")
                     connection_retries += 1
