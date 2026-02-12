@@ -313,15 +313,20 @@ async def main() -> None:
     max_connection_retries = 5
     
     # Register handler for channel posts
-    @app.on_message(filters.chat(SOURCE_CHANNEL) & filters.channel)
+    # Remove filters.channel to catch all messages from the channel
+    @app.on_message(filters.chat(SOURCE_CHANNEL))
     async def channel_post_handler(client: Client, message: Message):
         """Handle new channel posts."""
+        logger.info(f"Message received from chat: {message.chat.id} ({message.chat.title or message.chat.username or 'N/A'})")
+        logger.info(f"Expected source channel: {SOURCE_CHANNEL}")
         await handle_channel_post(client, message)
     
     # Register handler for edited channel posts
-    @app.on_edited_message(filters.chat(SOURCE_CHANNEL) & filters.channel)
+    @app.on_edited_message(filters.chat(SOURCE_CHANNEL))
     async def edited_channel_post_handler(client: Client, message: Message):
         """Handle edited channel posts."""
+        logger.info(f"Edited message received from chat: {message.chat.id} ({message.chat.title or message.chat.username or 'N/A'})")
+        logger.info(f"Expected source channel: {SOURCE_CHANNEL}")
         await handle_channel_post(client, message)
     
     # Start the client with retry logic
@@ -337,6 +342,30 @@ async def main() -> None:
             # Get info about the logged-in user
             me = await app.get_me()
             logger.info(f"Logged in as: {me.first_name} (@{me.username or 'N/A'})")
+            
+            # Verify access to channels
+            try:
+                logger.info("Verifying access to channels...")
+                
+                # Check source channel
+                try:
+                    source_chat = await app.get_chat(SOURCE_CHANNEL)
+                    logger.info(f"✓ Source channel accessible: {source_chat.title} (@{source_chat.username or 'N/A'}) - ID: {source_chat.id}")
+                except Exception as e:
+                    logger.error(f"✗ Cannot access source channel {SOURCE_CHANNEL}: {e}")
+                    logger.error("Make sure you are a member of the source channel!")
+                
+                # Check target channel
+                try:
+                    target_chat = await app.get_chat(TARGET_CHANNEL)
+                    logger.info(f"✓ Target channel accessible: {target_chat.title} (@{target_chat.username or 'N/A'}) - ID: {target_chat.id}")
+                except Exception as e:
+                    logger.error(f"✗ Cannot access target channel {TARGET_CHANNEL}: {e}")
+                    logger.error("Make sure you have permission to send messages to the target channel!")
+                
+                logger.info("Channel verification complete. Listening for messages...")
+            except Exception as e:
+                logger.warning(f"Error verifying channels: {e}")
             
             # Keep the client running using asyncio.Event
             # This will wait indefinitely until interrupted
