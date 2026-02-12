@@ -18,6 +18,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Fix encoding for Windows console
+if sys.platform == 'win32':
+    try:
+        import codecs
+        # Check if stdout has encoding attribute and buffer
+        if hasattr(sys.stdout, 'buffer') and hasattr(sys.stdout, 'encoding'):
+            if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+                sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+        if hasattr(sys.stderr, 'buffer') and hasattr(sys.stderr, 'encoding'):
+            if sys.stderr.encoding and sys.stderr.encoding.lower() != 'utf-8':
+                sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+    except (AttributeError, LookupError, ValueError):
+        # If codecs not available or already UTF-8, continue
+        pass
+
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
