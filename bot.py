@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -32,14 +34,6 @@ if sys.platform == 'win32':
     except (AttributeError, LookupError, ValueError):
         # If codecs not available or already UTF-8, continue
         pass
-
-# Fix for Python 3.14+ event loop issue
-# Create event loop before importing pyrogram to avoid RuntimeError
-try:
-    loop = asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
@@ -172,6 +166,70 @@ def replace_first_number(text: str, original: str, replacement: str) -> str:
     # Use count=1 to replace only the first occurrence
     modified_text = re.sub(escaped_original, replacement, text, count=1)
     return modified_text
+
+
+def check_session_lock(session_name: str) -> tuple[bool, str]:
+    """
+    Check if the session file is locked and provide helpful information.
+    
+    Args:
+        session_name: Name of the session file (without .session extension)
+        
+    Returns:
+        tuple: (is_locked, error_message)
+    """
+    session_file = Path(f"{session_name}.session")
+    session_journal = Path(f"{session_name}.session-journal")
+    
+    if not session_file.exists():
+        return False, ""
+    
+    # Try to open the database in exclusive mode to check if it's locked
+    try:
+        conn = sqlite3.connect(str(session_file), timeout=1.0)
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.rollback()
+        conn.close()
+        return False, ""
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e).lower():
+            error_msg = (
+                f"Session file '{session_file}' is locked. This usually means:\n"
+                f"  1. Another instance of the bot is already running\n"
+                f"  2. A previous instance didn't close properly\n"
+                f"  3. The session file is corrupted\n\n"
+                f"Solutions:\n"
+                f"  - Check if another bot instance is running and stop it\n"
+                f"  - Wait a few seconds and try again\n"
+                f"  - If the problem persists, delete '{session_file}' and '{session_journal}' "
+                f"(you'll need to re-authenticate)\n"
+            )
+            return True, error_msg
+        else:
+            return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
+
+async def wait_for_session_unlock(session_name: str, max_wait: int = 30, check_interval: float = 2.0) -> bool:
+    """
+    Wait for the session file to become unlocked.
+    
+    Args:
+        session_name: Name of the session file
+        max_wait: Maximum time to wait in seconds
+        check_interval: Time between checks in seconds
+        
+    Returns:
+        bool: True if unlocked, False if still locked after max_wait
+    """
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
+        is_locked, _ = check_session_lock(session_name)
+        if not is_locked:
+            return True
+        await asyncio.sleep(check_interval)
+    return False
 
 
 def save_post_to_file(message_data: dict) -> None:
@@ -386,6 +444,17 @@ async def main() -> None:
         logger.info(f"Expected source channel: {SOURCE_CHANNEL}")
         await handle_channel_post(client, message)
     
+    # Check for session lock before starting
+    is_locked, lock_message = check_session_lock(SESSION_NAME)
+    if is_locked:
+        logger.warning("Session file is locked. Attempting to wait for unlock...")
+        logger.warning(lock_message)
+        unlocked = await wait_for_session_unlock(SESSION_NAME, max_wait=30)
+        if not unlocked:
+            logger.error("Session file is still locked after waiting. Please resolve the issue and try again.")
+            logger.error(lock_message)
+            return
+    
     # Start the client with retry logic
     logger.info("Attempting to connect to Telegram...")
     logger.info("If you experience connection timeouts, check:")
@@ -445,12 +514,48 @@ async def main() -> None:
                 logger.error("Max connection retries reached. Exiting...")
                 logger.error("Please check your internet connection and firewall settings.")
                 break
-        except KeyboardInterrupt:
-            logger.info("Stopping client...")
-            break
         except Exception as e:
-            logger.error(f"Unexpected error: {e}", exc_info=True)
-            connection_retries += 1
+            # Check if it's a database lock error
+            error_str = str(e).lower()
+            is_db_lock = False
+            
+            # Check the main exception message
+            if "database is locked" in error_str:
+                is_db_lock = True
+            # Check exception cause
+            elif isinstance(e.__cause__, sqlite3.OperationalError):
+                if "database is locked" in str(e.__cause__).lower():
+                    is_db_lock = True
+            # Check if it's a direct sqlite3.OperationalError
+            elif isinstance(e, sqlite3.OperationalError):
+                if "database is locked" in error_str:
+                    is_db_lock = True
+            
+            if is_db_lock:
+                logger.error("Database lock error detected!")
+                is_locked, lock_message = check_session_lock(SESSION_NAME)
+                if is_locked:
+                    logger.error(lock_message)
+                    logger.info("Waiting for session to unlock...")
+                    unlocked = await wait_for_session_unlock(SESSION_NAME, max_wait=30)
+                    if unlocked:
+                        logger.info("Session unlocked! Retrying connection...")
+                        connection_retries = 0  # Reset retries since we resolved the lock
+                        await asyncio.sleep(2)  # Brief pause before retry
+                        continue
+                    else:
+                        logger.error("Session is still locked. Please resolve the issue manually.")
+                        logger.error("You may need to:")
+                        logger.error(f"  1. Stop any other running instances of the bot")
+                        logger.error(f"  2. Delete '{SESSION_NAME}.session' and '{SESSION_NAME}.session-journal' if corrupted")
+                        break
+                else:
+                    logger.error(f"Database lock error: {e}")
+                    connection_retries += 1
+            else:
+                logger.error(f"Unexpected error: {e}", exc_info=True)
+                connection_retries += 1
+            
             if connection_retries < max_connection_retries:
                 # Exponential backoff: increase delay with each retry
                 retry_delay = base_retry_delay * (1.5 ** (connection_retries - 1))
@@ -459,6 +564,9 @@ async def main() -> None:
             else:
                 logger.error("Max connection retries reached. Exiting...")
                 break
+        except KeyboardInterrupt:
+            logger.info("Stopping client...")
+            break
         finally:
             try:
                 if app.is_connected:
