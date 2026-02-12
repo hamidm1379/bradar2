@@ -35,7 +35,15 @@ if sys.platform == 'win32':
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import (
+    FloodWait, 
+    RPCError,
+    ChatWriteForbidden,
+    ChannelPrivate,
+    UsernameNotOccupied,
+    PeerIdInvalid,
+    UserBannedInChannel
+)
 from pyrogram.types import Message
 
 # Load environment variables
@@ -267,6 +275,17 @@ async def handle_channel_post(client: Client, message: Message) -> None:
                 save_post_to_file(message_data)
                 return
                 
+            except (ChatWriteForbidden, ChannelPrivate, UsernameNotOccupied, PeerIdInvalid, UserBannedInChannel) as e:
+                # These errors should not be retried - they indicate permission/access issues
+                error_msg = f"Cannot send message to target channel {TARGET_CHANNEL}: {e}"
+                logger.error(error_msg)
+                if message_data:
+                    message_data["error"] = str(e)
+                    message_data["error_type"] = type(e).__name__
+                    save_post_to_file(message_data)
+                # Don't retry for permission errors
+                return
+                
             except (ConnectionError, asyncio.TimeoutError, OSError) as e:
                 retries += 1
                 if retries < MAX_RETRIES:
@@ -274,9 +293,22 @@ async def handle_channel_post(client: Client, message: Message) -> None:
                     await asyncio.sleep(RETRY_DELAY)
                 else:
                     logger.error(f"Failed to send message after {MAX_RETRIES} attempts: {e}")
-                    message_data["error"] = str(e)
-                    save_post_to_file(message_data)
+                    if message_data:
+                        message_data["error"] = str(e)
+                        message_data["error_type"] = "ConnectionError"
+                        save_post_to_file(message_data)
                     raise
+                    
+            except RPCError as e:
+                # Other RPC errors - log and don't retry
+                error_msg = f"Telegram RPC error while sending to {TARGET_CHANNEL}: {e}"
+                logger.error(error_msg, exc_info=True)
+                if message_data:
+                    message_data["error"] = str(e)
+                    message_data["error_type"] = type(e).__name__
+                    save_post_to_file(message_data)
+                # Don't retry for RPC errors (except FloodWait which is handled separately)
+                return
     
     except FloodWait as e:
         logger.warning(f"Flood wait: {e.value} seconds. Waiting...")
